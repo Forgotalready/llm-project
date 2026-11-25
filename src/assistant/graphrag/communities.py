@@ -5,8 +5,6 @@ import networkx as nx
 from assistant.infra.llm import LLMClient
 from assistant.infra.schemas import Community
 
-<<<<<<< Updated upstream
-=======
 SEED = 7
 MAX_WORDS = 150
 SYSTEM = (
@@ -15,7 +13,6 @@ SYSTEM = (
     "Используй только приведённые факты и числа, не выдумывай. Пиши по-русски."
 )
 
->>>>>>> Stashed changes
 
 def detect_communities(graph: nx.DiGraph) -> list[Community]:
     """Разбивает узлы на сообщества алгоритмом Лувена с фиксированным `seed`.
