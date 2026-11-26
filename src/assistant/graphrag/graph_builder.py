@@ -2,7 +2,7 @@
 
 import networkx as nx
 
-from assistant.infra.schemas import ExtractionResult, Entity
+from assistant.infra.schemas import Entity, ExtractionResult
 
 
 def build_graph(results: list[ExtractionResult]) -> nx.DiGraph:

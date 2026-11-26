@@ -6,77 +6,55 @@ from collections.abc import Callable
 
 from assistant.agent.tools import TOOL_SCHEMAS
 from assistant.infra.erp_client import ErpUnavailable
-from assistant.infra.grounding import find_codes, normalize_code
-from assistant.infra.llm import LLMClient, ToolCall, tool_message
+from assistant.infra.grounding import code_type, find_codes, normalize_code
+from assistant.infra.llm import LLMClient, tool_message
 from assistant.infra.schemas import AgentResult, ToolStep
 
-REFUSAL_TEXT = "В базе знаний не найдено."
-
-SYSTEM_PROMPT = (
-    "Ты ассистент сервисной службы «ПолярТех». Помогаешь диспетчеру найти нужную деталь, "
-    "проверить её цену и наличие на складах в ERP и оформить заказ.\n"
-    "Правила работы:\n"
-    "1. Если в вопросе нет номера детали, сначала вызови search_knowledge (или summarize_topic для обзорных вопросов).\n"
-    "2. Никогда не выдумывай коды деталей, цены и остатки.\n"
-    "3. Различай исходы ERP: остаток 0 шт. означает, что деталь есть в каталоге, но закончилась; "
-    "ошибка «не найдена» означает, что такой детали в ERP не существует.\n"
-    "4. Если данных в базе знаний нет (refused=True), ответь: «В базе знаний не найдено.»\n"
-    "5. Отвечай кратко, точно, с указанием кодов и чисел из результатов инструментов."
+SYSTEM = (
+    "Ты ассистент диспетчера сервисной службы «ПолярТех». Отвечай по-русски. "
+    "Инструменты: search_knowledge (граф документов), summarize_topic (обзор), check_stock, get_price, "
+    "create_service_order (ERP). Правила: номера деталей бери только из вопроса или результатов "
+    "search_knowledge; сначала найди деталь в базе знаний, затем обращайся в ERP; остаток 0 и «данных нет» "
+    "– разные исходы; цены и остатки называй только из результатов инструментов; заказ создаётся только "
+    "после подтверждения человека; если данных нет, напиши «в базе знаний не найдено»."
 )
-
-_NUMBER_RE = r"(?<![\w-])(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)(?![\w-])"
-_WITH_UNIT_RE = re.compile(rf"({_NUMBER_RE})\s*(руб|₽|шт)")
-
-
-def _digits(raw: str) -> str:
-    return re.sub(r"\D", "", raw)
-
-
-def _extract_allowed_codes(text: str) -> set[str]:
-    return set(find_codes(text))
-
-
-def _has_user_quantity(question: str) -> bool:
-    """Проверяет, назвал ли пользователь количество штук в вопросе."""
-    q_without_codes = question
-    for code in find_codes(question):
-        q_without_codes = q_without_codes.replace(code, " ")
-    # Убираем стандартные записи кодов с пробелами/дефисами, чтобы цифры внутри кодов не считались количеством
-    q_cleaned = re.sub(r"\b[A-Za-zА-Яа-яЁё]{1,2}[- ]?\d{2,4}[A-Za-zА-Яа-яЁё]?\b", " ", q_without_codes)
-    return bool(re.search(r"(?<!\d)\d+(?!\d)", q_cleaned))
+REFUSAL = "В базе знаний не найдено."
+# Обязательные аргументы берём из тех же схем, что видит модель: один источник правды.
+REQUIRED = {
+    schema["function"]["name"]: set(schema["function"]["parameters"].get("required", [])) for schema in TOOL_SCHEMAS
+}
+ERP_TOOLS = {"check_stock", "get_price", "create_service_order"}
+# Число, стоящее отдельно: «1042» внутри P-1042B числом не считается.
+_PLAIN_NUMBER = re.compile(r"(?<![\w-])\d+(?![\w-])")
+# Проверяем только цены и остатки (руб/₽/шт). Норму времени в минутах не трогаем:
+# она есть в документах и выдуманной ценой не является.
+_UNIT_NUMBER = re.compile(r"(?<![\w-])(\d{1,3}(?:[ \u00a0\u202f]\d{3})+|\d+)\s*(руб|₽|шт)")
 
 
-def _verify_final_answer(answer: str, allowed_codes: set[str], tool_outputs: list[dict]) -> list[str]:
-    """Возвращает список расхождений (неподтверждённых кодов, цен или остатков) в итоговом ответе."""
-    problems: list[str] = []
-    for code in find_codes(answer):
-        if code not in allowed_codes:
-            problems.append(f"код {code}")
-
-    tool_text = json.dumps(tool_outputs, ensure_ascii=False)
-    tool_numbers = set(re.findall(r"\d+", tool_text))
-    for raw_num, unit in _WITH_UNIT_RE.findall(answer):
-        num = _digits(raw_num)
-        if num not in tool_numbers:
-            problems.append(f"{num} {unit}")
-
-    return problems
-
-
-def _execute_with_retries(fn: Callable[..., dict], args: dict) -> tuple[dict | None, str | None]:
-    """Вызывает инструмент; при ErpUnavailable повторяет ещё 2 раза (всего 3 попытки)."""
-    last_exc: Exception | None = None
-    for _ in range(3):
+def _invoke(fn: Callable[..., dict], args: dict) -> tuple[dict | None, str | None]:
+    """Вызов инструмента с повторами только на «сервис недоступен»."""
+    last = None
+    for _ in range(3):  # FR-8: первая попытка плюс два повтора
         try:
-            res = fn(**args)
-            if isinstance(res, dict) and "error" in res:
-                return res, str(res["error"])
-            return res, None
+            return fn(**args), None
         except ErpUnavailable as exc:
-            last_exc = exc
+            last = str(exc)  # временный сбой — есть смысл повторить
         except TypeError as exc:
-            return None, f"неверные аргументы: {exc}"
-    return None, f"ERP временно недоступна после 3 попыток: {last_exc}"
+            # Лишний или неверный аргумент: повтор ничего не изменит, отдаём ошибку модели.
+            return None, f"аргументы не подходят инструменту: {exc}"
+    return None, f"данные ERP получить не удалось: {last}"
+
+
+def _fabricated(text: str, question: str, tool_text: str) -> list[str]:
+    """Что в ответе взято не из вопроса и не из результатов инструментов (FR-10)."""
+    allowed_codes = set(find_codes(question)) | set(find_codes(tool_text))
+    issues = [code for code in find_codes(text) if code not in allowed_codes]
+    allowed_numbers = set(re.findall(r"\d+", tool_text)) | set(re.findall(r"\d+", question))
+    for raw, unit in _UNIT_NUMBER.findall(text):
+        digits = re.sub(r"\D", "", raw)  # «2 630» и «2630» — одно число
+        if digits not in allowed_numbers:
+            issues.append(f"{digits} {unit}")
+    return issues
 
 
 def run_agent(
@@ -88,163 +66,160 @@ def run_agent(
     confirm: bool = False,
 ) -> AgentResult:
     """Ведёт диалог с моделью в цикле «рассуждение, вызов инструмента, наблюдение»."""
-    messages: list[dict] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
-    ]
-
+    messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": question}]
     steps: list[ToolStep] = []
     sources: list[str] = []
-    seen_sources: set[str] = set()
-    allowed_codes: set[str] = _extract_allowed_codes(question)
-    tool_outputs: list[dict] = []
-    call_cache: dict[tuple[str, str], tuple[dict | None, str | None]] = {}
-
-
-
-    def add_sources(new_sources: list[str]) -> None:
-        for doc in new_sources:
-            if doc not in seen_sources:
-                seen_sources.add(doc)
-                sources.append(doc)
-
-    tool_calls_made = 0
+    cache: dict[str, dict] = {}  # FR-7: повторный вызов с теми же аргументами не идёт в ERP снова
+    # Номер детали разрешено брать только отсюда: вопрос плюс результаты прошлых инструментов.
+    allowed_parts = {code for code in find_codes(question) if code_type(code) == "Part"}
+    question_numbers = set(_PLAIN_NUMBER.findall(question))
+    executed = 0
+    interrupted = False
     final_text = ""
 
-    while True:
-        available_schemas = TOOL_SCHEMAS if tool_calls_made < max_steps else None
-        reply = llm.chat(messages, tools=available_schemas)
+    # Запас итераций сверх max_steps нужен, чтобы после лимита модель успела дать итоговый ответ.
+    for _ in range(max_steps + 8):
+        reply = llm.chat(messages, tools=TOOL_SCHEMAS)
+        if not reply.tool_calls:
+            final_text = reply.content  # модель ответила текстом — цикл закончен
+            break
         messages.append(reply.as_message())
 
-        if not reply.tool_calls:
-            final_text = reply.content.strip()
-            break
+        if executed >= max_steps:
+            # Инструменты больше не выполняем, но цикл не рвём: каждое обращение модели
+            # получает наблюдение с ошибкой, пока она не сформулирует итог (FR-7).
+            for call in reply.tool_calls:
+                messages.append(tool_message(call, {"error": "лимит шагов исчерпан, инструмент не выполнен"}))
+            if not interrupted:
+                interrupted = True
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Лимит шагов исчерпан. Дай итоговый ответ и сообщи, что работа прервана."
+                    }
+                )
+            continue
 
+        pending = None
         for call in reply.tool_calls:
-            if tool_calls_made >= max_steps:
-                err = f"достигнут лимит шагов ({max_steps})"
-                steps.append(ToolStep(call.name, call.arguments, error=err))
-                messages.append(tool_message(call, {"error": err}))
-                continue
+            name, args = call.name, call.arguments
+            error = None
+            if name not in tools:
+                error = f"неизвестный инструмент {name!r}, доступны: {', '.join(sorted(tools))}"
+            elif not isinstance(args, dict) or "_raw" in args:
+                # LLMClient кладёт "_raw", когда аргументы не разобрались как JSON.
+                error = "аргументы вызова не читаются, передай корректный JSON по схеме инструмента"
+            elif not REQUIRED.get(name, set()) <= set(args):
+                missing = sorted(REQUIRED.get(name, set()) - set(args))
+                error = f"не хватает аргументов: {', '.join(missing)}"
 
-            tool_calls_made += 1
-
-            if call.name not in tools:
-                err = f"неизвестный инструмент: {call.name}"
-                steps.append(ToolStep(call.name, call.arguments, error=err))
-                messages.append(tool_message(call, {"error": err}))
-                continue
-
-            if "_raw" in call.arguments:
-                err = f"некорректный JSON в аргументах: {call.arguments['_raw']}"
-                steps.append(ToolStep(call.name, call.arguments, error=err))
-                messages.append(tool_message(call, {"error": err}))
-                continue
-
-            args = dict(call.arguments)
-
-            if "part_id" in args:
-                raw_part = str(args["part_id"])
-                norm_part = normalize_code(raw_part) or raw_part.strip().upper()
-                if norm_part not in allowed_codes:
-                    err = (
-                        f"номер детали {raw_part} не упоминался в вопросе и не найден в базе знаний; "
-                        "сначала вызовите search_knowledge, чтобы узнать номер детали"
+            if error is None and name in ERP_TOOLS:
+                raw_part = args.get("part_id")
+                part = normalize_code(raw_part) if isinstance(raw_part, str) else None
+                if part is None or code_type(part) != "Part":
+                    error = f"неверный номер детали {raw_part!r}"
+                elif part not in allowed_parts:
+                    # Главная защита от выдуманной детали: номер должен быть чем-то подтверждён.
+                    error = (
+                        f"номер детали {part} не встречается в вопросе или результатах инструментов. "
+                        "Сначала вызови search_knowledge и возьми номер из его ответа."
                     )
-                    steps.append(ToolStep(call.name, args, error=err))
-                    messages.append(tool_message(call, {"error": err}))
-                    continue
+                else:
+                    args = {**args, "part_id": part}  # в ERP и в steps уходит канонический номер
 
-            if call.name == "create_service_order":
-                if not _has_user_quantity(question):
-                    clarification = "Уточните, пожалуйста, какое количество деталей необходимо заказать?"
-                    steps.append(ToolStep(call.name, args, error="количество не указано в вопросе"))
-                    return AgentResult(
-                        answer=clarification,
-                        steps=steps,
-                        sources=sources,
-                        refused=False,
-                        needs_confirmation=False,
-                        pending_action=None,
-                    )
-                if not confirm:
-                    return AgentResult(
-                        answer="Подтвердите оформление заказа.",
-                        steps=steps,
-                        sources=sources,
-                        refused=False,
-                        needs_confirmation=True,
-                        pending_action={"tool": "create_service_order", "args": args},
-                    )
+            if error is None and name == "create_service_order":
+                qty = args.get("qty")
+                if isinstance(qty, str) and qty.isdigit():
+                    qty = int(qty)
+                if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+                    error = f"неверное количество {args.get('qty')!r}"
+                elif str(qty) not in question_numbers:
+                    # Количество разрешено брать ТОЛЬКО из вопроса: подставленная единица —
+                    # это заказ, которого человек не просил.
+                    error = "количество не названо пользователем, уточни его у диспетчера"
+                else:
+                    model_raw = args.get("model")
+                    model = normalize_code(model_raw) if isinstance(model_raw, str) else None
+                    if model is None or code_type(model) != "Model":
+                        error = f"неверный код модели {model_raw!r}"
+                    else:
+                        args = {**args, "qty": qty, "model": model}
 
-            cache_key = (call.name, json.dumps(args, ensure_ascii=False, sort_keys=True))
-            if cache_key in call_cache:
-                result, error = call_cache[cache_key]
-            else:
-                result, error = _execute_with_retries(tools[call.name], args)
-                call_cache[cache_key] = (result, error)
-
-            steps.append(ToolStep(call.name, args, result=result, error=error))
-
+            if error is None and name == "create_service_order" and not confirm:
+                # FR-9: заказ дошёл до вызова, но без подтверждения человека не выполняем.
+                # Шаг в steps НЕ пишем: успешным считается шаг с error=None, а заказа не было.
+                pending = {"tool": name, "args": args}
+                messages.append(tool_message(call, {"status": "ожидает подтверждения человека", **args}))
+                break
 
             if error is not None:
-                payload = result if isinstance(result, dict) else {"error": error}
-                messages.append(tool_message(call, payload))
+                # Отклонённый вызов — это наблюдение для модели, цикл продолжается.
+                steps.append(ToolStep(name, args if isinstance(args, dict) else {}, error=error))
+                messages.append(tool_message(call, {"error": error}))
+                continue
+
+            key = json.dumps({"tool": name, "args": args}, ensure_ascii=False, sort_keys=True)
+            if key in cache:
+                result = cache[key]  # тот же вопрос к ERP — тот же ответ, без сетевого вызова
             else:
-                assert result is not None
-                tool_outputs.append(result)
-                allowed_codes |= _extract_allowed_codes(json.dumps(result, ensure_ascii=False))
-                if isinstance(result.get("sources"), list):
-                    add_sources(result["sources"])
-                messages.append(tool_message(call, result))
+                executed += 1  # лимит считаем по реальным выполнениям, а не по ошибкам проверок
+                result, call_error = _invoke(tools[name], args)
+                if call_error is not None:
+                    steps.append(ToolStep(name, args, error=call_error))
+                    messages.append(tool_message(call, {"error": call_error}))
+                    continue
+                cache[key] = result
 
-                # Если лимит шагов исчерпан, просим модель подвести итог по уже собранным данным
-        if tool_calls_made >= max_steps:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": "Лимит вызовов инструментов исчерпан. Кратко ответь по уже полученным данным "
-                    "и укажи, что проверка прервана из-за ограничения шагов.",
-                }
+            if "error" in result:
+                # «Данных нет» и отказ ERP помечаем как ошибку шага, но текст сохраняем для модели:
+                # исходы должны остаться различимыми и в ответе тоже.
+                steps.append(ToolStep(name, args, error=str(result["error"])))
+            else:
+                steps.append(ToolStep(name, args, result=result))
+                # Результат поиска расширяет список разрешённых номеров деталей:
+                # так цепочка «граф -> ERP» становится возможной.
+                for code in find_codes(json.dumps(result, ensure_ascii=False)):
+                    if code_type(code) == "Part":
+                        allowed_parts.add(code)
+                for doc in result.get("sources") or []:
+                    if doc not in sources:
+                        sources.append(doc)  # источники копим по ходу диалога (FR-10)
+            messages.append(tool_message(call, result))
+
+        if pending is not None:
+            # Ответ собираем кодом: он обязан назвать деталь, количество, склад и модель,
+            # иначе человеку нечего подтверждать.
+            a = pending["args"]
+            answer = (
+                f"Готов заказать {a['qty']} шт. детали {a['part_id']} со склада «{a['warehouse']}» "
+                f"для {a['model']}. Подтвердите заказ."
             )
-            final_reply = llm.chat(messages)
-            final_text = final_reply.content.strip()
-            if not final_text:
-                gathered = "; ".join(
-                    f"{s.tool}: {json.dumps(s.result, ensure_ascii=False)}"
-                    for s in steps
-                    if s.error is None and s.result is not None
-                )
-                final_text = f"Работа прервана по лимиту шагов ({max_steps}). Собранные данные: {gathered or 'нет'}."
-            break
-    
-    if "не найдено" in final_text.lower():
-        return AgentResult(answer=REFUSAL_TEXT, steps=steps, sources=[], refused=True)
+            return AgentResult(answer, steps=steps, sources=sources, needs_confirmation=True, pending_action=pending)
 
-    # 6. Финальная сверка кодов, цен и остатков в ответе (FR-10)
-    problems = _verify_final_answer(final_text, allowed_codes, tool_outputs)
-    if problems:
+    text = final_text.strip()
+    if interrupted:
+        text = (text + " Работа прервана: лимит шагов исчерпан.").strip()
+    if not text:
+        return AgentResult(REFUSAL, steps=steps, sources=sources, refused=True)
+
+    # FR-10: сверяем готовый ответ с фактами. В ход идут только успешные результаты инструментов.
+    tool_text = json.dumps([step.result for step in steps if step.result is not None], ensure_ascii=False)
+    issues = _fabricated(text, question, tool_text)
+    if issues:
+        messages.append({"role": "assistant", "content": text})
         messages.append(
             {
                 "role": "user",
-                "content": (
-                    f"В твоём ответе есть неподтверждённые данные ({', '.join(problems)}). "
-                    "Исправь ответ, используя ТОЛЬКО коды, цены и остатки из вопроса и результатов инструментов. "
-                    "Если данных нет, напиши: «В базе знаний не найдено.»"
-                ),
+                "content": "В ответе есть факты, которых нет в вопросе и результатах инструментов: "
+                + ", ".join(issues)
+                + ". Исправь ответ, опирайся только на полученные данные.",
             }
         )
-        retry_reply = llm.chat(messages)
-        final_text = retry_reply.content.strip()
-        if "не найдено" in final_text.lower():
-            return AgentResult(answer=REFUSAL_TEXT, steps=steps, sources=[], refused=True)
+        reply = llm.chat(messages, tools=TOOL_SCHEMAS)  # ровно одна попытка исправления
+        text = reply.content.strip()
+        if reply.tool_calls or not text or _fabricated(text, question, tool_text):
+            # Второй раз расходимся с фактами — отказываем фиксированной формулировкой:
+            # в ней заведомо нет ни выдуманного кода, ни выдуманной цены.
+            return AgentResult(REFUSAL, steps=steps, sources=sources, refused=True)
 
-        if _verify_final_answer(final_text, allowed_codes, tool_outputs):
-            return AgentResult(answer=REFUSAL_TEXT, steps=steps, sources=[], refused=True)
-
-    return AgentResult(
-        answer=final_text,
-        steps=steps,
-        sources=sources,
-        refused=False,
-    )
+    return AgentResult(text, steps=steps, sources=sources, refused="не найдено" in text.lower())
